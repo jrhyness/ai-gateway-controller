@@ -54,16 +54,21 @@ normal handoff/finalizer path.
 For one client-visible model, equal positive ExternalProvider weights are
 eligible together and use Praxis' uniform `random` selection policy. An
 omitted weight means one, weight zero disables that reference, and unequal
-positive weights fail with `WeightUnsupported`. A single eligible provider
-remains deterministic. Repeating the same provider across `ExternalModel`
-objects with the same client-visible model name is rejected; otherwise that
-provider would receive extra random-selection entries. This change adds overlay
-selection metadata and checks compatibility before transport changes. It does
-not add controller/ExtProc rollout coordination, proportional weighting,
-health-aware selection, or retries. Final-provider withdrawal and empty-overlay
-behavior remain outside this change in issue #106. Partial provider withdrawal
-ordering remains a separate issue tracked in
+positive weights use Praxis `weightedRandom` with per-candidate
+`traffic_weight` (CRD weight 1–100 pass-through; Praxis accepts 1–1000). A
+single eligible provider remains deterministic. Repeating the same provider
+across `ExternalModel` objects with the same client-visible model name is
+rejected; otherwise that provider would receive extra selection entries. This
+does not add controller/ExtProc rollout coordination, health-aware selection,
+or retries. An explicit all-zero weight update withdraws the model's route
+and overlay candidates and reports `Ready=False/NoRoutes`, even when a
+referenced provider is missing or unready. Unrelated models retain their
+serving state. Readiness-driven final-provider withdrawal remains tracked in
+issue #106. Partial provider withdrawal ordering
+remains a separate issue tracked in
 [#108](https://github.com/opendatahub-io/ai-gateway-controller/issues/108).
+Requires a Praxis ExtProc / AI image that accepts `weightedRandom` and
+`traffic_weight` (praxis-ai #1068; included in the ExtProc pin used by AGC).
 
 ### ExternalProvider status ownership
 
@@ -722,7 +727,7 @@ ai-gateway-controller/
 | `--authorino-namespace` | `kuadrant-system` | Authorino namespace allowed through the auth proxy NetworkPolicy |
 | `--consumer-portal-dashboard-namespace` | `redhat-ods-applications` | Namespace containing the consumer portal Service |
 | `--leader-elect` | `false` | Enable when running multiple replicas |
-| `--metrics-bind-address`, `--health-probe-bind-address` | `:8080`, `:8081` | Standard controller-runtime endpoints |
+| `--metrics-bind-address`, `--metrics-secure`, `--health-probe-bind-address` | `:8443`, `true`, `:8081` | Standard controller-runtime endpoints. Defaults are deliberately not restated in `config/self/manager/manager.yaml` — see the note there |
 
 ## Tooling & conventions
 

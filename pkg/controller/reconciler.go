@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -21,10 +22,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -102,16 +105,19 @@ type Reconciler struct {
 // Secret and tenant changes also reconcile providers independently of any model.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	inScope := predicate.NewPredicateFuncs(func(obj client.Object) bool { return r.namespaceAllowed(obj.GetNamespace()) })
-	if err := builder.ControllerManagedBy(mgr).
+	models := builder.ControllerManagedBy(mgr).
 		For(&v1alpha1.ExternalModel{}, builder.WithPredicates(inScope)).
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.providerModels), builder.WithPredicates(inScope)).
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretModels), builder.WithPredicates(inScope)).
-		// The tenant reconciler creates the tenant-local Praxis Service. A
-		// model may otherwise publish an HTTPRoute before that Service exists;
-		// Istio can retain ResolvedRefs=False until the route is reconciled
-		// again. Service events are namespace-scoped and therefore only fan out
-		// to models in the affected tenant.
-		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope)).
+		// The tenant reconciler creates the tenant-local Praxis Service. Service events are namespace-scoped and therefore only affect
+		// models in the affected tenant.
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope))
+	// Model routes enable the post-auth filter only while the tenant has
+	// post-auth filters, so re-check them when one of those inputs changes.
+	for _, src := range tenant.PostAuthFilterSources() {
+		models = models.Watches(src.Object, r.postAuthFilterHandler(src), builder.WithPredicates(src.Predicate))
+	}
+	if err := models.
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
 		// Gateway attachments: route acceptance is reported in HTTPRoute
@@ -267,6 +273,92 @@ func (r *Reconciler) serviceModels(ctx context.Context, obj client.Object) []rec
 		return nil
 	}
 	return r.modelsInNamespace(ctx, obj.GetNamespace())
+}
+
+// postAuthFilterRetryDelays are the waits between retries when the tenant
+// lookup fails temporarily. The event won't fire again, so without retries
+// models attached to the tenant's Gateway would be missed.
+var postAuthFilterRetryDelays = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
+
+// postAuthFilterHandler queues the models of each tenant affected by a
+// change. It holds the queue so it can retry later.
+//
+//nolint:ireturn // controller-runtime watches take a handler.EventHandler.
+func (r *Reconciler) postAuthFilterHandler(src tenant.PostAuthFilterSource) handler.EventHandler {
+	enqueue := func(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request], objects ...client.Object) {
+		for _, obj := range objects {
+			for _, namespace := range src.Tenants(ctx, r.Client, obj) {
+				r.enqueuePostAuthFilterModels(ctx, q, namespace, 0)
+			}
+		}
+	}
+	return handler.Funcs{
+		CreateFunc: func(ctx context.Context, e event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+		UpdateFunc: func(ctx context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.ObjectOld, e.ObjectNew)
+		},
+		DeleteFunc: func(ctx context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+		GenericFunc: func(ctx context.Context, e event.GenericEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+	}
+}
+
+// enqueuePostAuthFilterModels queues the tenant's models and retries if the
+// tenant lookup failed temporarily. Other failures are only logged; fixing
+// the MaasTenantConfig or AITenant triggers a new pass.
+func (r *Reconciler) enqueuePostAuthFilterModels(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request], namespace string, attempt int) {
+	if ctx.Err() != nil || q.ShuttingDown() {
+		return
+	}
+	requests, err := r.postAuthFilterModels(ctx, namespace)
+	for _, request := range requests {
+		q.Add(request)
+	}
+	if err == nil {
+		return
+	}
+	if !transientReadError(err) || attempt >= len(postAuthFilterRetryDelays) {
+		r.Log.Error(err, "resolve tenant for post-auth filter event; gateway-attached models were not enqueued",
+			"namespace", namespace, "attempts", attempt+1)
+		return
+	}
+	time.AfterFunc(postAuthFilterRetryDelays[attempt], func() {
+		r.enqueuePostAuthFilterModels(ctx, q, namespace, attempt+1)
+	})
+}
+
+// postAuthFilterModels returns the tenant's models: those in its namespace
+// and those attached to its Gateway. If the tenant lookup fails, it still
+// returns the ones in its namespace, along with the error.
+func (r *Reconciler) postAuthFilterModels(ctx context.Context, tenantNamespace string) ([]reconcile.Request, error) {
+	if !r.namespaceAllowed(tenantNamespace) {
+		return nil, nil
+	}
+	requests := r.modelsInNamespace(ctx, tenantNamespace)
+	resolution, err := r.resolveTenantForNamespace(ctx, tenantNamespace)
+	if err != nil {
+		return requests, err
+	}
+	if resolution.aitenant == nil {
+		return requests, nil
+	}
+	seen := make(map[types.NamespacedName]struct{}, len(requests))
+	for _, request := range requests {
+		seen[request.NamespacedName] = struct{}{}
+	}
+	for _, request := range r.gatewayAttachedModels(ctx, resolution.aitenant) {
+		if _, ok := seen[request.NamespacedName]; ok {
+			continue
+		}
+		seen[request.NamespacedName] = struct{}{}
+		requests = append(requests, request)
+	}
+	return requests, nil
 }
 
 func (r *Reconciler) tenantModels(ctx context.Context, ait *unstructured.Unstructured) []reconcile.Request {
@@ -635,6 +727,12 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		} else if revoked {
 			err = nil
 		}
+		// An explicit all-zero weight update is an administrative withdrawal,
+		// not a provider-readiness failure. Let the no-route cleanup below
+		// remove the previous selection instead of preserving it as LKG.
+		if errors.Is(err, resolver.ErrNoRoutes) && allRoutesExplicitlyWeightDisabled(set) {
+			err = nil
+		}
 	}
 	if err != nil {
 		return r.handleHomeRouteResolutionError(ctx, req.Namespace, modelTenant, set, model.Name, string(model.UID), err, report)
@@ -724,6 +822,11 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		// keep serving.
 		return reconcile.Result{}, report(false, reasonProviderNotReady, message, nil)
 	}
+	if explicitlyWeightDisabledModels(set)[req.Namespace+"/"+req.Name] {
+		// A healthy sibling can keep the tenant overlay alive, but this model
+		// itself has no eligible providers and must not remain Ready.
+		return reconcile.Result{}, report(false, reasonNoRoutes, "all ExternalModel provider references are explicitly disabled by weight", nil)
+	}
 	if reason, message, unrouted := unroutedStatus(set, req.String()); unrouted {
 		// Other models of the namespace are served, but none of this model's
 		// references resolved: it has no route or overlay candidate.
@@ -754,8 +857,17 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 		if unroutedReason, unroutedMessage, ok := unroutedStatus(set, namespace+"/"+modelName); ok {
 			reason, message = unroutedReason, unroutedMessage
 		}
-		policyExcluded := translationPolicyExcludedModels(set)
-		if len(policyExcluded) > 0 {
+		excluded := translationPolicyExcludedModels(set)
+		disabledByWeight := explicitlyWeightDisabledModels(set)
+		for modelRef := range disabledByWeight {
+			excluded[modelRef] = true
+		}
+		if len(excluded) > 0 {
+			if disabledByWeight[namespace+"/"+modelName] {
+				reason = reasonNoRoutes
+			} else if excluded[namespace+"/"+modelName] {
+				reason = reasonTranslationDisabled
+			}
 			valid, err := r.livePraxisBeforeWrite(ctx, namespace, modelTenant)
 			if err != nil {
 				return reconcile.Result{}, err
@@ -771,7 +883,7 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 			home := attachmentTenant{namespace: namespace, tenantID: tenant.ID(modelTenant.aitenant.GetName()),
 				gateway:               v1alpha1.NamespacedObjectReference{Name: modelTenant.gatewayName, Namespace: modelTenant.gatewayNamespace},
 				apiTranslationEnabled: modelTenant.apiTranslationEnabled}
-			if err := r.cleanupPolicyExcludedHomeModels(ctx, home, set, policyExcluded, sourceUID); err != nil {
+			if err := r.cleanupExcludedHomeModels(ctx, home, set, excluded, sourceUID); err != nil {
 				return reconcile.Result{}, err
 			}
 			return reconcile.Result{}, routeErr
@@ -1252,10 +1364,11 @@ func translationPolicyExcludedModels(set *resolver.ResolvedRouteSet) map[string]
 	return excluded
 }
 
-// cleanupPolicyExcludedHomeModels removes only routes made ineligible by the
-// tenant's API-translation policy. Other models with provider/readiness errors
-// keep their last-known route patches and overlay candidates.
-func (r *Reconciler) cleanupPolicyExcludedHomeModels(
+// cleanupExcludedHomeModels removes only candidates made ineligible by an
+// explicit model-local policy, such as disabled API translation or an
+// all-zero provider weight. Other models with provider/readiness errors keep
+// their last-known route patches and overlay candidates.
+func (r *Reconciler) cleanupExcludedHomeModels(
 	ctx context.Context,
 	home attachmentTenant,
 	set *resolver.ResolvedRouteSet,
@@ -1266,9 +1379,13 @@ func (r *Reconciler) cleanupPolicyExcludedHomeModels(
 	if err != nil {
 		return fmt.Errorf("read current overlay candidates before translation-policy cleanup: %w", err)
 	}
+	excludedScopedIDs, err := r.excludedScopedCandidateIDs(ctx, home.namespace, excluded)
+	if err != nil {
+		return err
+	}
 	keptCandidates := make([]envelope.Candidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		policyExcluded := false
+		policyExcluded := excludedScopedIDs[candidate.StableID]
 		for modelRef := range excluded {
 			modelNamespace, modelName, found := strings.Cut(modelRef, "/")
 			if found && modelNamespace == home.namespace && strings.HasPrefix(candidate.StableID, modelName+"/provider-") {
@@ -1791,13 +1908,12 @@ func (r *Reconciler) validateResolvedRouteSet(ctx context.Context, set *resolver
 
 // excludeUnsupportedModelSelection excludes every model contributing to a
 // conflicting client-visible capability. The overlay selects candidates by
-// client name, so unequal weights or repeated providers across model objects
-// must not affect unrelated models in the namespace.
+// client name, so repeated providers across model objects must not affect
+// unrelated models in the namespace. Unequal positive weights are valid and
+// render as Praxis weightedRandom.
 func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver.ResolvedRouteSet, map[string]error) {
 	valid := &resolver.ResolvedRouteSet{Models: make([]resolver.ModelRoutes, 0, len(set.Models))}
 	rejected := make(map[string]error)
-	weights := make(map[string]int)
-	weightConflicts := make(map[string]bool)
 	bindings := make(map[string]bool)
 	duplicateProviders := make(map[string]bool)
 	for _, model := range set.Models {
@@ -1805,11 +1921,6 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 			rejected[model.ModelRef] = fmt.Errorf("%d HTTPRoute rules exceed the Gateway API limit of %d", count, maxHTTPRouteRules)
 		}
 		for _, route := range model.Routes {
-			if weight, seen := weights[route.ClientName]; seen && weight != route.Weight {
-				weightConflicts[route.ClientName] = true
-			} else {
-				weights[route.ClientName] = route.Weight
-			}
 			binding := route.ClientName + "\x00" + route.ProviderNamespace + "/" + route.Provider
 			if bindings[binding] {
 				duplicateProviders[route.ClientName] = true
@@ -1819,10 +1930,6 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 	}
 	for _, model := range set.Models {
 		for _, route := range model.Routes {
-			if weightConflicts[route.ClientName] {
-				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s has unequal weights", envelope.ErrWeightUnsupported, route.ClientName)
-				break
-			}
 			if duplicateProviders[route.ClientName] {
 				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s repeats a provider", envelope.ErrDuplicateProvider, route.ClientName)
 				break
@@ -1833,6 +1940,34 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 		}
 	}
 	return valid, rejected
+}
+
+func allRoutesExplicitlyWeightDisabled(set *resolver.ResolvedRouteSet) bool {
+	disabled := explicitlyWeightDisabledModels(set)
+	return set != nil && len(set.Models) > 0 && len(disabled) == len(set.Models)
+}
+
+func explicitlyWeightDisabledModels(set *resolver.ResolvedRouteSet) map[string]bool {
+	disabled := make(map[string]bool)
+	if set == nil {
+		return disabled
+	}
+	for _, model := range set.Models {
+		if len(model.Routes) != 0 || len(model.Skips) == 0 {
+			continue
+		}
+		allDisabled := true
+		for _, skip := range model.Skips {
+			if skip.Reason != resolver.SkipWeightDisabled {
+				allDisabled = false
+				break
+			}
+		}
+		if allDisabled {
+			disabled[model.ModelRef] = true
+		}
+	}
+	return disabled
 }
 
 func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.ResolvedRouteSet,
@@ -1990,6 +2125,10 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 			},
 		},
 	}}
+	postAuth, err := tenant.HasPostAuthFilters(ctx, r.Client, modelNamespace)
+	if err != nil {
+		return err
+	}
 	kept := append(make([]any, 0, len(preserved)+len(routes)*3+len(attached)*3+2), preserved...)
 
 	byModel := map[string][]resolver.Route{}
@@ -2033,6 +2172,62 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 			responseMode = "STREAMED"
 		}
 		for index := 0; index < route.count; index++ {
+			perFilter := map[string]any{
+				externalModelPreExtProcFilter: map[string]any{
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"overrides": map[string]any{
+						"processing_mode": map[string]any{
+							"request_header_mode": "SEND",
+							// The pre-auth processor extracts the model from JSON before
+							// authentication. Give its body-field-to-header filter the
+							// complete request body; only post-auth Praxis needs streamed
+							// chunks for selected-provider translation.
+							"request_body_mode":     "BUFFERED",
+							"response_header_mode":  "SKIP",
+							"response_body_mode":    "NONE",
+							"request_trailer_mode":  "SKIP",
+							"response_trailer_mode": "SKIP",
+						},
+					},
+				},
+				externalModelExtProcFilter: map[string]any{
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					// ExtProcPerRoute is disable-only when the
+					// vhost config is disabled. An overrides
+					// object is the supported way for this
+					// more-specific ExternalModel route to
+					// re-enable the filter.
+					"overrides": map[string]any{
+						"processing_mode": map[string]any{
+							"request_header_mode": "SEND",
+							// Buffer every request so Envoy sends one complete body message,
+							// including when trailers follow: stream_usage_inject and the
+							// translation filters need the whole JSON body. The pre-auth
+							// processor already buffers it.
+							"request_body_mode":    "BUFFERED",
+							"response_header_mode": "SEND",
+							// Envoy chooses the response processing mode before the
+							// provider is selected. Stream all rules for a model that
+							// can select Messages; retain NONE for OpenAI-only models.
+							"response_body_mode":    responseMode,
+							"request_trailer_mode":  "SKIP",
+							"response_trailer_mode": "SKIP",
+						},
+					},
+				},
+				"envoy.filters.http.ext_proc.ipp-pre": map[string]any{
+					"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"disabled": true,
+				},
+			}
+			// The "ipp" filter runs the tenant's post-auth filters. Leave it
+			// on when the tenant has any; otherwise turn it off.
+			if !postAuth {
+				perFilter["envoy.filters.http.ext_proc.ipp"] = map[string]any{
+					"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"disabled": true,
+				}
+			}
 			kept = append(kept, map[string]any{
 				"applyTo": "HTTP_ROUTE",
 				"match": map[string]any{
@@ -2045,58 +2240,7 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 				},
 				"patch": map[string]any{
 					"operation": "MERGE",
-					"value": map[string]any{"typed_per_filter_config": map[string]any{
-						externalModelPreExtProcFilter: map[string]any{
-							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"overrides": map[string]any{
-								"processing_mode": map[string]any{
-									"request_header_mode": "SEND",
-									// The pre-auth processor extracts the model from JSON before
-									// authentication. Give its body-field-to-header filter the
-									// complete request body; only post-auth Praxis needs streamed
-									// chunks for selected-provider translation.
-									"request_body_mode":     "BUFFERED",
-									"response_header_mode":  "SKIP",
-									"response_body_mode":    "NONE",
-									"request_trailer_mode":  "SKIP",
-									"response_trailer_mode": "SKIP",
-								},
-							},
-						},
-						externalModelExtProcFilter: map[string]any{
-							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							// ExtProcPerRoute is disable-only when the
-							// vhost config is disabled. An overrides
-							// object is the supported way for this
-							// more-specific ExternalModel route to
-							// re-enable the filter.
-							"overrides": map[string]any{
-								"processing_mode": map[string]any{
-									"request_header_mode": "SEND",
-									// Buffer every request so Envoy sends one complete body message,
-									// including when trailers follow: stream_usage_inject and the
-									// translation filters need the whole JSON body. The pre-auth
-									// processor already buffers it.
-									"request_body_mode":    "BUFFERED",
-									"response_header_mode": "SEND",
-									// Envoy chooses the response processing mode before the
-									// provider is selected. Stream all rules for a model that
-									// can select Messages; retain NONE for OpenAI-only models.
-									"response_body_mode":    responseMode,
-									"request_trailer_mode":  "SKIP",
-									"response_trailer_mode": "SKIP",
-								},
-							},
-						},
-						"envoy.filters.http.ext_proc.ipp-pre": map[string]any{
-							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"disabled": true,
-						},
-						"envoy.filters.http.ext_proc.ipp": map[string]any{
-							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"disabled": true,
-						},
-					}},
+					"value":     map[string]any{"typed_per_filter_config": perFilter},
 				},
 			})
 		}
@@ -2605,3 +2749,25 @@ func providerSelectionSink(route resolver.Route, namespace string) unstructured.
 
 var _ client.Object = (*v1alpha1.ExternalModel)(nil)
 var _ client.Object = (*v1alpha1.ExternalProvider)(nil)
+
+// excludedScopedCandidateIDs derives scoped identities from provider references,
+// including hashed identities, without conflating shared client-visible names.
+func (r *Reconciler) excludedScopedCandidateIDs(ctx context.Context, namespace string, excluded map[string]bool) (map[string]bool, error) {
+	ids := make(map[string]bool)
+	for modelRef := range excluded {
+		modelNamespace, modelName, found := strings.Cut(modelRef, "/")
+		if !found || modelNamespace != namespace {
+			continue
+		}
+		var model v1alpha1.ExternalModel
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: modelNamespace, Name: modelName}, &model); err != nil {
+			return nil, fmt.Errorf("read excluded model %s to identify scoped candidates: %w", modelRef, err)
+		}
+		for _, ref := range model.Spec.ExternalProviderRefs {
+			if ref.Ref.Namespace != "" && ref.Ref.Namespace != modelNamespace {
+				ids[envelope.ScopedStableID(modelNamespace, modelName, ref.Ref.Namespace, ref.Ref.Name)] = true
+			}
+		}
+	}
+	return ids, nil
+}
