@@ -178,3 +178,32 @@ func TestNotControllerOwnedSecret(t *testing.T) {
 		t.Error("foreign secret excluded; want admitted")
 	}
 }
+
+func TestTenantSecretPredicate(t *testing.T) {
+	preds := tenantSecretPredicate()
+	owned := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agc-cred-x", Labels: map[string]string{managedByLabel: render.FieldOwner}}}
+	foreign := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "source-api-key"}}
+
+	if preds.Create(event.CreateEvent{Object: owned}) {
+		t.Error("create of controller-owned secret admitted; want excluded")
+	}
+	if !preds.Create(event.CreateEvent{Object: foreign}) {
+		t.Error("create of foreign secret excluded; want admitted")
+	}
+	if preds.Update(updateFor(owned, owned)) {
+		t.Error("update of controller-owned secret admitted; want excluded")
+	}
+	if !preds.Update(updateFor(foreign, foreign)) {
+		t.Error("update of foreign secret excluded; want admitted")
+	}
+	// Deletes are always admitted: a credential copy is removed by the
+	// attachment reconciler acting on the model in the model's namespace, so
+	// the Secret delete is the only tenant-side trigger to drop the candidate
+	// from the rendered stack. A foreign source being deleted must equally
+	// reconcile.
+	for _, obj := range []client.Object{owned, foreign} {
+		if !preds.Delete(event.DeleteEvent{Object: obj}) {
+			t.Errorf("delete of %s excluded; want admitted", obj.GetName())
+		}
+	}
+}

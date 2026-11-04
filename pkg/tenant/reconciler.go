@@ -113,11 +113,9 @@ type Reconciler struct {
 	Log logr.Logger
 }
 
-// SetupWithManager registers the MaasTenantConfig watch (primary trigger)
-// and a secondary AITenant watch mapped back to the owning MaasTenantConfig,
-// mirroring maas-controller's own TenantReconciler.SetupWithManager shape.
-// tenantEventPredicates filters the tenant reconciler's watches so that only
-// events that can change the rendered praxis stack enqueue a reconcile.
+// tenantEventPredicates returns the watch predicates that filter the tenant
+// reconciler's watches so that only events that can change the rendered
+// praxis stack enqueue a reconcile.
 //
 // Without predicates, every update to a watched object — including status-only
 // writes and Secret metadata bumps — re-applied the whole tenant stack. In
@@ -208,18 +206,39 @@ func aitenantConfigNamespace(obj client.Object) string {
 }
 
 // notControllerOwnedSecret reports whether a Secret was not rendered by this
-// controller. The tenant Secret watch exists to react to credential sources
-// changing in the tenant namespace; without this filter it also fired on this
-// controller's own output — projected credential copies (agc-cred-*) and the
-// payload-processing ServiceAccount's dockercfg — self-triggering a full
-// praxis re-apply per write. OpenShift-injected dockercfg churn
-// (builder/deployer/default tokens) is not excludable at watch time, but it
-// only occurs at namespace lifecycle boundaries, before the MaasTenantConfig
-// it would enqueue exists.
+// controller, i.e. is a credential source rather than controller output.
 func notControllerOwnedSecret(obj client.Object) bool {
 	return obj.GetLabels()[managedByLabel] != render.FieldOwner
 }
 
+// tenantSecretPredicate filters the tenant Secret watch. The watch exists to
+// react to credential sources changing in the tenant namespace; without the
+// filter it also fired on this controller's own output — projected credential
+// copies (agc-cred-*) and the payload-processing ServiceAccount's dockercfg —
+// self-triggering a full praxis re-apply per write. OpenShift-injected
+// dockercfg churn (builder/deployer/default tokens) is not excludable at watch
+// time, but it only occurs at namespace lifecycle boundaries, before the
+// MaasTenantConfig it would enqueue exists.
+//
+// Deletes are always admitted, including of controller-owned copies: a copy
+// is removed by the attachment reconciler acting on the model in the model's
+// namespace, which no tenant-side watch maps back to this tenant, so the
+// Secret delete is the only event that can trigger the tenant reconcile
+// dropping the candidate (and its Secret mount) from the rendered stack.
+// Dropping it would leave the ExtProc mounting a deleted Secret — blocking
+// new pods — until the resync interval.
+func tenantSecretPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return notControllerOwnedSecret(e.Object) },
+		UpdateFunc:  func(e event.UpdateEvent) bool { return notControllerOwnedSecret(e.ObjectNew) },
+		GenericFunc: func(e event.GenericEvent) bool { return notControllerOwnedSecret(e.Object) },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	}
+}
+
+// SetupWithManager registers the MaasTenantConfig watch (primary trigger)
+// and secondary watches mapped back to the owning MaasTenantConfig,
+// mirroring maas-controller's own TenantReconciler.SetupWithManager shape.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	preds := tenantEventPredicates()
 	return ctrl.NewControllerManagedBy(mgr).
@@ -234,7 +253,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
 			builder.WithPredicates(preds["externalprovider"])).
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
-			builder.WithPredicates(predicate.NewPredicateFuncs(notControllerOwnedSecret))).
+			builder.WithPredicates(tenantSecretPredicate())).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForRoutingOverlay)).
 		Watches(&aigatewayv1alpha1.AIGuardrail{},
 			handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
@@ -967,6 +986,8 @@ func combineRuntimeCandidates(home, attached []envelope.Candidate, homeErr error
 // A candidate whose copy no longer exists is skipped: its attachment was
 // removed and the entry is inert until the next overlay publish drops it,
 // so mounting the missing Secret would only block the ExtProc rollout.
+// Absence is confirmed against the API server, because the metadata cache can
+// lag the copy written alongside the overlay that triggered this reconcile.
 // The bool reports a controller-owned overlay that cannot be parsed.
 func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace string) ([]envelope.Candidate, bool, error) {
 	var configMap corev1.ConfigMap
@@ -994,10 +1015,26 @@ func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace st
 			copySecret.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
 			key := client.ObjectKey{Namespace: candidate.Credential.SecretRef.Namespace, Name: candidate.Credential.SecretRef.Name}
 			if err := r.Client.Get(ctx, key, copySecret); err != nil {
-				if apierrors.IsNotFound(err) {
+				if !apierrors.IsNotFound(err) {
+					return nil, false, fmt.Errorf("get credential copy %s: %w", key, err)
+				}
+				// The cache can lag the write that published this overlay
+				// entry: the overlay ConfigMap event that triggered this
+				// reconcile can arrive before the Secret informer observed
+				// the copy written alongside it. Read the API server before
+				// concluding the copy is gone — answering the lag as absence
+				// silently drops the candidate from the rendered ExtProc
+				// mount until the next event. Mirrors the live-read fallback
+				// in the attachment reconciler's credentialCopyOwned.
+				if r.APIReader == nil {
 					continue
 				}
-				return nil, false, fmt.Errorf("get credential copy %s: %w", key, err)
+				if err := r.APIReader.Get(ctx, key, copySecret); err != nil {
+					if apierrors.IsNotFound(err) {
+						continue
+					}
+					return nil, false, fmt.Errorf("live get credential copy %s: %w", key, err)
+				}
 			}
 			// Credential.Header is json:"-" and is lost on the overlay round-trip;
 			// restore it from the copy Secret stamped at attach time — but only from
